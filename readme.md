@@ -615,6 +615,114 @@ It is held in memory only, deliberately: writing it to disk would make a fresh l
 
 ---
 
+## 🛡️ Reliability & Autonomous Desktop Control Upgrade
+
+Mark LVI introduces an industrial-grade reliability upgrade designed for dependable 24/7 Windows operation, autonomous desktop control, and safety-critical execution gates.
+
+### 1. Explicit Assistant State Machine
+The assistant lifecycle is governed by an explicit, thread-safe state machine (`core/state_machine.py`) with 9 observable states:
+
+```
+[STARTING] ──> [SLEEPING / WAKE_WORD_LISTENING] ──(Wake Phrase / PTT)──> [LISTENING]
+                               ▲                                            │
+                               │                                            ▼
+                           (Cooldown)                                  [THINKING]
+                               │                                            │
+                               │                                            ▼
+                           [VERIFYING] <── (Task Step) ────────────── [EXECUTING]
+                                                                            │
+                        [PAUSED_FOR_MANUAL_CONTROL] <── (Physical Input) ───┤
+                                                                            ▼
+                                                                [OFFLINE / STOPPED]
+```
+
+* **STARTING**: Initial boot, single-instance verification, audio subsystem configuration.
+* **SLEEPING / WAKE_WORD_LISTENING**: Lightweight background listening. Audio never leaves the machine; heavy LLM / browser / vision modules remain unloaded.
+* **LISTENING**: Actively receiving speech (triggered by wake word or Push-to-Talk).
+* **THINKING**: Reasoning via Gemini Live or configured local engine; Avatar looks away in thought.
+* **EXECUTING**: Performing browser, system, or desktop actions.
+* **VERIFYING**: Confirming observable outcomes in the system/DOM (e.g., video playing, Wi-Fi state changed).
+* **PAUSED_FOR_MANUAL_CONTROL**: Immediate freeze when human user moves mouse or presses keyboard keys.
+* **OFFLINE**: Network disconnected. Bounded exponential backoff retries cloud reconnection in background without hanging the audio thread.
+* **STOPPED**: Emergency stop triggered or session cancelled.
+
+---
+
+### 2. Windows Startup & Single-Instance Safety
+* **Named Mutex Enforcement**: Protects against multiple JARVIS processes using the Windows Named Mutex `Global\JARVIS_MARK_LVI_SINGLE_INSTANCE_MUTEX`. Subsequent attempts log a warning and immediately exit cleanly, preventing competing microphone captures or wake-word races.
+* **Registry Auto-Start (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`)**: Enable or disable "Start with Windows" in one click from the UI drawer (**⚙ → Controls → START WITH WINDOWS**).
+* **Background Wake Mode**: When launched with `--background`, JARVIS loads strictly in sleep mode, keeping memory minimal until you call it.
+* **Real-World Idle Benchmark (Measured on this machine)**:
+  * **Base Process Footprint**: `21.1 MB` RAM
+  * **Active Wake-Word Mode (RSS)**: `173.0 MB` RAM (OpenWakeWord ONNX + melspectrogram + embedding models loaded)
+  * **Process Idle CPU**: `< 0.5%` (0.00% - 0.4% across 8 logical cores)
+  * Heavy browser automation, vision models, and streaming network sessions remain **0 MB** until woken.
+* **Resilient Network Monitor**: Bounded exponential backoff (`2.0s -> 4.0s -> 8.0s -> 16.0s -> max 30.0s`) reconnects cloud AI when the internet returns, without dropping audio buffers or locking the UI.
+* **Microphone Recovery**: If the default audio input disconnects or fails at boot, `AudioDeviceMonitor` polls with non-blocking recovery until an audio device is available.
+
+---
+
+### 3. Wake-Phrase Capabilities & Limitations: "Hey Jarvis" vs "Hello Jarvis"
+* **The Reality of OpenWakeWord Models**: The bundled pretrained ONNX model in `openwakeword` is trained exclusively for **"Hey Jarvis"** (`hey_jarvis_v0.1.onnx`).
+* **Why "Hello Jarvis" is not the default**: Phonetic acoustic patterns between "Hey" and "Hello" differ significantly. Using the "Hey Jarvis" model to detect "Hello Jarvis" produces frequent false-negatives or misfires.
+* **Custom Model Path**: To use "Hello Jarvis", train a custom ONNX wake model for that phrase and place `hello_jarvis.onnx` into the `openwakeword/resources/models/` directory. JARVIS inspects available models and safely falls back to "Hey Jarvis" with full transparency.
+* **Cooldown & Queue Draining**: Built-in 2.0-second cooldown suppresses double-triggers from room echoes, and the audio queue is purged on wakeup to prevent stale audio feeds.
+
+---
+
+### 4. Zero-AI Voice Interruption & Global Emergency Stop
+* **Global Hotkey**: Press **`Ctrl+Alt+S`** (or `Ctrl+Shift+Escape`) at any time to instantly trigger an Emergency Stop.
+* **Zero-AI Local Voice Interruption**: During long-running executions, speech input is parsed directly on the client machine without waiting for cloud LLM round-trips:
+  * English: `"stop"`, `"cancel"`, `"pause"`, `"give me control"`, `"abort"`
+  * Hindi: `"रुको"`, `"रुक जाओ"`, `"बंद करो"`
+  * Gujarati: `"રોકો"`, `"ઊભા રહો"`, `"બંધ કરો"`
+  * Turkish: `"dur"`, `"durdur"`, `"iptal"`
+* **Immediate Action Abort**: Ongoing desktop and browser loops check the cancellation token before and during every action, halting instantly and restoring user control.
+
+---
+
+### 5. Immediate Manual Takeover
+* **Low-Level Windows Input Monitor (`core/manual_takeover.py`)**: Continuously monitors physical mouse pointer deltas and keyboard key states via Win32 APIs.
+* **Synthetic Event Discrimination**: Injected automation events (from `pyautogui` or Playwright) are tagged with an execution grace period. Genuine human mouse movements or keystrokes instantly break the automation loop and transition to `PAUSED_FOR_MANUAL_CONTROL`.
+* **Clear User Status**: The assistant alerts "Manual control active" and relinquishes control immediately.
+
+---
+
+### 6. Robust Autonomous Browser Control
+* **RFC 3986 URL Encoding**: Queries are encoded using `quote_plus` to properly handle Unicode, ampersands (`&`), punctuation, and multilingual searches.
+* **Cookie & Popup Dismissal**: Automatically dismisses consent banners on YouTube, Google, and major websites.
+* **Semantic YouTube Playback**:
+  * Evaluates video search results by similarity score against artist and song query rather than blindly clicking index 0.
+  * **Observable Video Playback Verification**: Inspects `document.querySelector('video')` to confirm that the video element is unpaused, readyState >= 2, and `currentTime > 0` before claiming `done`.
+* **Standard Media Controls**: Voice operations for `media_play`, `media_pause`, `media_next`, `media_prev`, and `media_volume`.
+
+---
+
+### 7. Autonomous Desktop Screen Agent (`actions/screen_agent.py`)
+* **Perception-Action Loop**:
+  1. Capture current screen state.
+  2. Inspect active application window and target UI controls.
+  3. Formulate bounded action sequence (max 10 steps per invocation).
+  4. Perform action with takeover monitoring.
+  5. Inspect result and verify outcome.
+  6. Ask for clarification if target confidence is low rather than clicking random coordinates.
+
+---
+
+### 8. Native Windows Settings & Verification
+* **Wi-Fi Status & Toggle Verification**: `computer_settings.py` queries `wifi_status` via native Windows PowerShell (`Get-NetAdapter`) or `netsh wlan show interfaces` before and after toggling, confirming true RF state changes.
+* **Confirmation Gate Preservation**: Irreversible actions (Shutdown, Restart, Wi-Fi disconnect) require the human confirmation token on the HUD before execution.
+
+---
+
+### 9. Troubleshooting Guide
+* **"Another instance of JARVIS is already running"**: Check Task Manager for background `python.exe` processes or run `taskkill /F /IM python.exe`.
+* **Wake Word Not Triggering**: Ensure your microphone is selected in **⚙ → AUDIO DEVICES** and test sensitivity using **⚙ → WAKE WORD**.
+* **Browser Automation Errors**: Run `playwright install chromium` from your terminal if Playwright browsers are not yet downloaded.
+* **Manual Takeover Sensitivity**: Moving the mouse by more than 15 pixels during an automated screen task intentionally pauses execution for your safety.
+
+---
+
 ## 🗺️ Mark Roadmap
 
 | Mark | Focus |
@@ -735,7 +843,8 @@ Mark LVI/
 │   ├── computer_settings.py  # Volume, brightness, WiFi, power (per-OS)
 │   ├── computer_control.py   # Keyboard shortcuts, mouse, window management
 │   ├── open_app.py           # Application launcher (per-OS name map)
-│   ├── browser_control.py    # Web browser control
+│   ├── browser_control.py    # Web browser control with YouTube verification & media controls
+│   ├── screen_agent.py       # Autonomous screen agent with perception-action loop & manual takeover
 │   ├── file_controller.py    # File system operations
 │   ├── file_processor.py     # Document reading and summarization
 │   ├── send_message.py       # Messaging integration
@@ -752,6 +861,10 @@ Mark LVI/
 ├── core/
 │   ├── outcome.py            # What a tool tells the model: done / unverified / failed /
 │   │                         #   ask / started, plus the untrusted-content wrapper
+│   ├── state_machine.py      # Thread-safe assistant state machine (STARTING -> SLEEPING -> LISTENING -> THINKING -> EXECUTING -> VERIFYING -> PAUSED_FOR_MANUAL_CONTROL -> OFFLINE -> STOPPED)
+│   ├── emergency_stop.py     # Global hotkey (Ctrl+Alt+S) + multi-language zero-AI voice interruption
+│   ├── startup.py            # Windows named mutex single-instance lock, registry startup, exponential backoff network & audio device monitors
+│   ├── manual_takeover.py    # Win32 low-level physical input monitor distinguishing human input from synthetic automation
 │   ├── appidentity.py        # Which applications are running, which one the user named,
 │   │                         #   and which processes are the assistant's own (never a target)
 │   ├── lazyimport.py         # Heavy third-party imports paid only if they are used

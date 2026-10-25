@@ -14,22 +14,47 @@ Design goals:
 
 openwakeword ships small ONNX models (a few MB each) and runs comfortably on a
 CPU. The pretrained wake phrase used here is "Hey Jarvis".
+
+Wake-phrase notes
+─────────────────
+The bundled model is ``hey_jarvis`` which reliably detects the phrase
+**"Hey Jarvis"**.  "Hello Jarvis" is NOT reliably detected by this model — the
+phonetic patterns differ enough that the pretrained weights will either miss it
+entirely or fire with very low confidence.  If you want "Hello Jarvis" as a wake
+phrase you would need to train a custom openwakeword model on that phrase and
+place the resulting ``.onnx`` file into the openwakeword resources directory.
 """
 from __future__ import annotations
 
+import logging
 import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
 # Pretrained openwakeword model that listens for "Hey Jarvis".
 WAKE_MODEL = "hey_jarvis"
+# The actual phrase the model is trained to detect.
+WAKE_PHRASE = "Hey Jarvis"
 # Score in [0,1]; above this counts as a detection. Tunable per environment.
 DEFAULT_THRESHOLD = 0.5
 # Mic frames arrive at 16 kHz int16; this is just the detector's input rate.
 SAMPLE_RATE = 16000
+# After a detection fires, suppress further detections for this many seconds
+# to prevent double-triggers from the same or closely-spaced utterances.
+COOLDOWN_SECONDS = 2.0
+# How many consecutive queue-full drops before we log a warning (avoids spam).
+_QUEUE_DROP_LOG_INTERVAL = 50
+
+_log = logging.getLogger(__name__)
+
+
+def get_wake_phrase() -> str:
+    """Return the wake phrase the current model listens for."""
+    return WAKE_PHRASE
 
 
 def is_installed() -> bool:
@@ -129,11 +154,54 @@ class WakeWordDetector:
         self._model = None
         self._ready = False
 
+        # ── Cooldown & statistics ────────────────────────────────────────
+        self._last_detection: float = 0.0       # time.monotonic() of last fire
+        self._detections_count: int = 0
+        self._cooldown: float = COOLDOWN_SECONDS
+
+        # ── Queue-drop tracking (log periodically, not every frame) ──────
+        self._drop_count: int = 0
+
+        # ── Try to read threshold from user config (best-effort) ─────────
+        try:
+            from memory.config_manager import load_api_keys
+            saved = load_api_keys().get("wake_threshold")
+            if saved is not None:
+                val = float(saved)
+                if 0.1 <= val <= 0.95:
+                    self._threshold = val
+        except Exception:
+            pass
+
+    # ── Threshold management ─────────────────────────────────────────────
+
+    def set_threshold(self, value: float) -> None:
+        """Update the detection threshold at runtime.
+
+        ``value`` is clamped to [0.1, 0.95]. The new value is also persisted to
+        the config file so it survives restarts.
+        """
+        value = max(0.1, min(0.95, float(value)))
+        self._threshold = value
+        # Best-effort persist — never let a config write break audio.
+        try:
+            from memory.config_manager import _save_flag
+            _save_flag("wake_threshold", value)
+        except Exception:
+            pass
+
+    # ── Lifecycle ────────────────────────────────────────────────────────
+
     def start(self) -> bool:
         """Load the model and spawn the inference thread. Returns True on success.
         Safe to call again — a no-op if already running. Never raises."""
-        if self._running:
+        # Truly idempotent: check that the thread is *actually* alive, not just
+        # the _running flag (the thread may have crashed or been joined).
+        if self._running and self._thread is not None and self._thread.is_alive():
             return True
+        # If the flag was stale, clean up before restarting.
+        if self._running:
+            self._running = False
         try:
             from openwakeword.model import Model
             self._model = Model(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
@@ -150,18 +218,58 @@ class WakeWordDetector:
         return True
 
     def stop(self) -> None:
+        """Stop the detector thread and release the model.
+
+        Joins the thread with a timeout to guarantee a clean shutdown even if
+        the inference loop is blocked on a long prediction.
+        """
         self._running = False
         # unblock the thread if it's waiting on the queue
         try:
             self._queue.put_nowait(None)
         except Exception:
             pass
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+            if self._thread.is_alive():
+                self._logger("Wake word: thread did not exit within timeout.")
+            self._thread = None
         self._model = None
         self._ready = False
+
+    def restart(self) -> bool:
+        """Stop the detector, then start it again. Returns True on success."""
+        self.stop()
+        return self.start()
 
     @property
     def ready(self) -> bool:
         return self._ready
+
+    # ── Status ───────────────────────────────────────────────────────────
+
+    def get_status(self) -> dict:
+        """Return a snapshot of detector state for the UI or diagnostics.
+
+        Keys:
+          listening        — is the detector loop running
+          ready            — model loaded successfully
+          phrase           — the wake phrase being listened for
+          threshold        — current detection threshold
+          last_detection   — monotonic timestamp of last detection (0 if never)
+          detections_count — total detections since construction
+        """
+        return {
+            "listening":        self._running and self._thread is not None
+                                and self._thread.is_alive(),
+            "ready":            self._ready,
+            "phrase":           WAKE_PHRASE,
+            "threshold":        self._threshold,
+            "last_detection":   self._last_detection,
+            "detections_count": self._detections_count,
+        }
+
+    # ── Feed (audio input) ───────────────────────────────────────────────
 
     def feed(self, frame_int16) -> None:
         """Called from the mic callback (real-time thread). Must stay cheap and
@@ -173,9 +281,17 @@ class WakeWordDetector:
             data = frame_int16[:, 0].copy() if getattr(frame_int16, "ndim", 1) > 1 else frame_int16.copy()
             self._queue.put_nowait(data)
         except queue.Full:
-            pass
+            self._drop_count += 1
+            if self._drop_count % _QUEUE_DROP_LOG_INTERVAL == 1:
+                _log.warning(
+                    "Wake word: audio queue full — dropped %d frame(s) so far "
+                    "(inference may be slower than mic input).",
+                    self._drop_count,
+                )
         except Exception:
             pass
+
+    # ── Inference loop ───────────────────────────────────────────────────
 
     def _loop(self) -> None:
         import numpy as np
@@ -194,6 +310,14 @@ class WakeWordDetector:
                     if score == 0.0 and scores:
                         score = max(float(v) for v in scores.values())
                 if score >= self._threshold:
+                    # ── Cooldown guard ───────────────────────────────────
+                    now = time.monotonic()
+                    if (now - self._last_detection) < self._cooldown:
+                        self._drain()
+                        continue
+                    self._last_detection = now
+                    self._detections_count += 1
+
                     # drain any backlog so we don't double-fire on the same utterance
                     self._drain()
                     try:
@@ -207,5 +331,13 @@ class WakeWordDetector:
         try:
             while True:
                 self._queue.get_nowait()
+        except Exception:
+            pass
+
+    # ── Destructor ───────────────────────────────────────────────────────
+
+    def __del__(self) -> None:
+        try:
+            self.stop()
         except Exception:
             pass

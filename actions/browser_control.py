@@ -9,6 +9,7 @@ import platform
 import shutil
 import subprocess
 import threading
+import urllib.parse
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -88,10 +89,16 @@ def _normalize_url(url: str) -> str:
     Bare words like "instagram" → "https://instagram.com"
     Domains like "instagram.com" → "https://instagram.com"
     Full URLs pass through unchanged.
+    Blocks unsafe schemes like javascript:, data:, etc.
     """
     url = url.strip()
     if not url:
         return "about:blank"
+    # Block dangerous URI schemes
+    lower_url = url.lower()
+    for bad in ("javascript:", "data:", "vbscript:", "file:"):
+        if lower_url.startswith(bad):
+            return "about:blank"
     if "://" in url:
         return url
     # No dot at all → assume .com  (e.g. "instagram" → "instagram.com")
@@ -802,9 +809,267 @@ class _BrowserSession:
             "the page stayed blank - the address may be wrong, or the site may "
             "not have answered", url=url)
 
+
+    async def _dismiss_popups(self, p: Page) -> None:
+        """Dismiss common consent dialogs, cookie banners, and prompts."""
+        selectors = [
+            'button:has-text("Accept all")',
+            'button:has-text("I agree")',
+            'button:has-text("Reject all")',
+            'button[aria-label*="Accept" i]',
+            'button:has-text("No thanks")',
+            'ytd-button-renderer:has-text("Accept")',
+            'ytd-button-renderer:has-text("Agree")',
+            'button:has-text("Got it")',
+            'button:has-text("Dismiss")',
+        ]
+        for sel in selectors:
+            try:
+                btn = p.locator(sel).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(timeout=1000)
+                    await asyncio.sleep(0.3)
+                    break
+            except Exception:
+                pass
+
+    async def youtube_play(self, query: str, artist: str = "") -> str:
+        """Search YouTube, score results by title similarity, click best match,
+        and verify actual video playback using observable page evidence.
+        """
+        full_query = f"{query} {artist}".strip()
+        if not full_query:
+            return outcome.failed("browser_control", "No song or video title provided")
+
+        encoded = urllib.parse.quote_plus(full_query)
+        search_url = f"https://www.youtube.com/results?search_query={encoded}"
+        
+        page = await self._get_page()
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(0.5)
+            await self._dismiss_popups(page)
+        except Exception as e:
+            print(f"[Browser] YouTube search navigation notice: {e}")
+
+        # Wait for search results
+        try:
+            await page.wait_for_selector("ytd-video-renderer, #video-title", timeout=10_000)
+        except Exception:
+            return outcome.failed("browser_control", f"No search results appeared for: '{full_query}'")
+
+        # Collect candidate video items and select best match
+        best_element = None
+        best_title = ""
+        best_score = -1
+
+        try:
+            video_locators = page.locator("ytd-video-renderer #video-title")
+            count = min(await video_locators.count(), 8)
+            terms = set(re.findall(r"\w+", full_query.lower()))
+
+            candidates = []
+            for i in range(count):
+                loc = video_locators.nth(i)
+                title = (await loc.get_attribute("title") or await loc.inner_text()).strip()
+                if not title:
+                    continue
+                # Calculate overlap score
+                words = set(re.findall(r"\w+", title.lower()))
+                overlap = len(terms & words)
+                candidates.append((loc, title, overlap))
+
+            if candidates:
+                # Sort by score descending
+                candidates.sort(key=lambda c: c[2], reverse=True)
+                best_element, best_title, best_score = candidates[0]
+            else:
+                best_element = video_locators.first
+                best_title = await best_element.inner_text()
+        except Exception as e:
+            print(f"[Browser] Error inspecting YouTube results: {e}")
+            best_element = page.locator("ytd-video-renderer #video-title").first
+
+        if not best_element:
+            return outcome.failed("browser_control", f"Could not find matching video for '{full_query}'")
+
+        # Click the chosen video
+        try:
+            await best_element.click(timeout=8_000)
+            await asyncio.sleep(1.0)
+            await self._dismiss_popups(page)
+        except Exception as e:
+            return outcome.failed("browser_control", f"Failed clicking YouTube result: {e}")
+
+        # Observable verification of video playback
+        return await self._verify_video_playback(page, expected_title=best_title)
+
+    async def _verify_video_playback(self, page: Page, expected_title: str = "") -> str:
+        """Verify that playback has actually started via observable media state."""
+        # Wait up to 8s for video element
+        try:
+            await page.wait_for_selector("video", timeout=8_000)
+        except Exception:
+            # Check for age restriction or sign-in walls
+            body_text = await page.inner_text("body")
+            if any(k in body_text.lower() for k in ("sign in to confirm your age", "sign in", "private video")):
+                return outcome.ask(
+                    "browser_control",
+                    "This video requires user sign-in or manual age confirmation. Please sign in or confirm.",
+                    title=expected_title,
+                    url=page.url,
+                )
+            return outcome.failed("browser_control", "Video player element was not found on page", url=page.url)
+
+        # Check observable playback state using JS on the DOM video element
+        playback_state = {}
+        for attempt in range(12):
+            try:
+                playback_state = await page.evaluate('''() => {
+                    const v = document.querySelector("video");
+                    if (!v) return { found: false };
+                    // If video is paused, attempt to unpause (autoplay restrictions)
+                    if (v.paused && v.readyState >= 2) {
+                        v.play().catch(() => {});
+                    }
+                    return {
+                        found: true,
+                        paused: v.paused,
+                        currentTime: v.currentTime,
+                        duration: v.duration,
+                        readyState: v.readyState,
+                        title: document.title,
+                        url: window.location.href,
+                        error: v.error ? v.error.message : null
+                    };
+                }''')
+                if playback_state.get("found"):
+                    if not playback_state.get("paused") or playback_state.get("currentTime", 0) > 0.1:
+                        # Verified playing!
+                        cur_title = playback_state.get("title", expected_title).replace(" - YouTube", "")
+                        return outcome.done(
+                            "browser_control",
+                            playing=True,
+                            title=cur_title,
+                            url=page.url,
+                            currentTime=playback_state.get("currentTime", 0),
+                            verified=True,
+                        )
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        # If still paused or blocked, report status honestly
+        title = playback_state.get("title", expected_title).replace(" - YouTube", "")
+        if playback_state.get("error"):
+            return outcome.failed("browser_control", f"Playback error: {playback_state['error']}", title=title)
+
+        return outcome.unverified(
+            "browser_control",
+            "Video page opened, but active playback could not be verified automatically (may be blocked by autoplay permissions or ad).",
+            title=title,
+            url=page.url,
+        )
+
+    async def media_pause(self) -> str:
+        """Pause currently playing HTML5 video/audio."""
+        page = await self._get_page()
+        try:
+            paused = await page.evaluate('''() => {
+                const v = document.querySelector("video") || document.querySelector("audio");
+                if (v) {
+                    v.pause();
+                    return true;
+                }
+                return false;
+            }''')
+            if paused:
+                return outcome.done("browser_control", action="media_pause", paused=True, verified=True)
+            # Try keyboard space as fallback
+            await page.keyboard.press("k")
+            return outcome.unverified("browser_control", "Sent pause shortcut to page", verified=False)
+        except Exception as e:
+            return outcome.failed("browser_control", f"Pause failed: {e}")
+
+    async def media_play(self) -> str:
+        """Resume / play HTML5 video/audio."""
+        page = await self._get_page()
+        try:
+            played = await page.evaluate('''() => {
+                const v = document.querySelector("video") || document.querySelector("audio");
+                if (v) {
+                    v.play();
+                    return true;
+                }
+                return false;
+            }''')
+            if played:
+                return outcome.done("browser_control", action="media_play", playing=True, verified=True)
+            await page.keyboard.press("k")
+            return outcome.unverified("browser_control", "Sent play shortcut to page", verified=False)
+        except Exception as e:
+            return outcome.failed("browser_control", f"Play failed: {e}")
+
+    async def media_next(self) -> str:
+        """Skip to next video / track on YouTube or supported media sites."""
+        page = await self._get_page()
+        try:
+            # Check for YouTube next button
+            next_btn = page.locator(".ytp-next-button").first
+            if await next_btn.count() > 0 and await next_btn.is_visible():
+                await next_btn.click(timeout=3000)
+                await asyncio.sleep(1.0)
+                return await self._verify_video_playback(page)
+            # Fallback to Shift+N keyboard shortcut
+            await page.keyboard.press("Shift+N")
+            await asyncio.sleep(1.0)
+            return await self._verify_video_playback(page)
+        except Exception as e:
+            return outcome.failed("browser_control", f"Next media action failed: {e}")
+
+    async def media_prev(self) -> str:
+        """Return to previous video / track."""
+        page = await self._get_page()
+        try:
+            prev_btn = page.locator(".ytp-prev-button").first
+            if await prev_btn.count() > 0 and await prev_btn.is_visible():
+                await prev_btn.click(timeout=3000)
+                await asyncio.sleep(1.0)
+                return await self._verify_video_playback(page)
+            # Browser back as fallback
+            await page.go_back(wait_until="domcontentloaded", timeout=10000)
+            return await self._verify_video_playback(page)
+        except Exception as e:
+            return outcome.failed("browser_control", f"Previous media action failed: {e}")
+
+    async def media_volume(self, level: int) -> str:
+        """Set media player volume (0 - 100)."""
+        level = max(0, min(100, int(level)))
+        page = await self._get_page()
+        try:
+            res = await page.evaluate('''(lvl) => {
+                const v = document.querySelector("video") || document.querySelector("audio");
+                if (v) {
+                    v.volume = lvl / 100.0;
+                    return true;
+                }
+                return false;
+            }''', level)
+            if res:
+                return outcome.done("browser_control", action="media_volume", volume=level, verified=True)
+            return outcome.unverified("browser_control", "No video/audio element found to adjust volume")
+        except Exception as e:
+            return outcome.failed("browser_control", f"Volume adjustment failed: {e}")
+
+    async def verify_playback(self) -> str:
+        """Inspect observable playback state on the current page."""
+        page = await self._get_page()
+        return await self._verify_video_playback(page)
+
     async def search(self, query: str, engine: str = "google") -> str:
         base = _SEARCH_ENGINES.get(engine.lower(), _SEARCH_ENGINES["google"])
-        return await self.go_to(base + query.replace(" ", "+"))
+        encoded = urllib.parse.quote_plus(str(query or "").strip())
+        return await self.go_to(base + encoded)
 
     async def click(self, selector: str = None, text: str = None) -> str:
         page = await self._get_page()
@@ -1127,7 +1392,7 @@ def browser_control(
         if action == "search":
             base    = _SEARCH_ENGINES.get(params.get("engine", "google").lower(),
                                           _SEARCH_ENGINES["google"])
-            nav_url = base + params.get("query", "").replace(" ", "+")
+            nav_url = base + urllib.parse.quote_plus(str(params.get("query", "")).strip())
         else:
             nav_url = params.get("url", "").strip()
 
@@ -1156,7 +1421,24 @@ def browser_control(
             except Exception as e:
                 print(f"[Browser] Could not resume last page ({last}): {e}")
 
-        if action == "click":
+        if action in ("youtube_play", "play_video", "play_song"):
+            query = params.get("query") or params.get("title") or params.get("text", "")
+            artist = params.get("artist", "")
+            result = sess.run(sess.youtube_play(query, artist))
+        elif action in ("media_pause", "pause", "pause_song", "pause_video"):
+            result = sess.run(sess.media_pause())
+        elif action in ("media_play", "resume", "resume_song", "resume_video"):
+            result = sess.run(sess.media_play())
+        elif action in ("media_next", "next_song", "next_video", "next"):
+            result = sess.run(sess.media_next())
+        elif action in ("media_previous", "media_prev", "prev_song", "previous_song", "prev"):
+            result = sess.run(sess.media_prev())
+        elif action in ("media_volume", "volume"):
+            level = int(params.get("level", params.get("amount", 50)))
+            result = sess.run(sess.media_volume(level))
+        elif action in ("verify_playback", "playback_status"):
+            result = sess.run(sess.verify_playback())
+        elif action == "click":
             result = sess.run(sess.click(params.get("selector"), params.get("text")))
         elif action == "type":
             result = sess.run(sess.type_text(
@@ -1230,7 +1512,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
+                "description": "go_to | search | youtube_play | media_pause | media_play | media_next | media_prev | media_volume | verify_playback | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
             },
             "browser": {
                 "type": "STRING",

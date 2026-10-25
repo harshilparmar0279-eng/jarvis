@@ -63,6 +63,9 @@ from memory.memory_manager import (
 # (screen_process, close_camera, save_memory, manage_monitor, shutdown_jarvis,
 # system_status).
 from core import outcome
+from core.state_machine import get_state_machine, AssistantState
+from core.emergency_stop import get_emergency_stop, is_stop_command
+from core.startup import acquire_instance_lock, release_instance_lock, NetworkMonitor
 from core.action_loader import strip_meta
 from actions.screen_processor  import _capture_camera, _capture_screen
 from actions.system_monitor    import SystemMonitor, get_system_status
@@ -740,6 +743,7 @@ class JarvisLive:
             return
         self._awake = True
         self._last_user_speech = time.monotonic()   # start the auto-sleep clock now
+        get_state_machine().transition(AssistantState.LISTENING, reason=reason)
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
         self.ui.write_log(f"SYS: Awake — {reason}.")
@@ -749,6 +753,7 @@ class JarvisLive:
             return
         self._awake = False
         self.set_speaking(False)
+        get_state_machine().transition(AssistantState.SLEEPING, reason=reason)
         self.ui.set_state("SLEEPING")
         self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
 
@@ -1283,7 +1288,20 @@ class JarvisLive:
         args = dict(fc.args or {})
 
         print(f"[JARVIS] 🔧 {name}  {args}")
-        self.ui.set_state("THINKING")
+        
+        # Check emergency stop / cancellation token
+        estop = get_emergency_stop()
+        if estop.is_cancelled:
+            print(f"[JARVIS] 🛑 Cancelling tool execution for {name} due to active stop")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": outcome.failed(name, "Action was aborted by emergency stop")}
+            )
+
+        # Transition state machine and UI to EXECUTING
+        sm = get_state_machine()
+        sm.transition(AssistantState.EXECUTING, reason=f"Executing tool {name}")
+        self.ui.set_state("EXECUTING")
 
 
         if name == "save_memory":
@@ -1691,6 +1709,12 @@ class JarvisLive:
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+
+                                # Voice interruption check: "Stop", "Cancel", "Pause", "Give me control"
+                                if is_stop_command(txt):
+                                    print(f"[JARVIS] 🛑 Voice stop command recognized: '{txt}'")
+                                    get_emergency_stop().trigger(f"Voice command: '{txt}'")
+                                    self.interrupt()
 
                         if sc.turn_complete:
                             if self._turn_done_event:
@@ -2632,18 +2656,70 @@ class JarvisLive:
             await asyncio.sleep(delay)
 
 def main():
+    # ── 1. Single Instance Check (Named Windows Mutex) ───────────────────────
+    if not acquire_instance_lock():
+        print("[JARVIS] ⚠️ Another instance of JARVIS is already running. Exiting.")
+        sys.exit(0)
+
+    # ── 2. Initialize Emergency Stop & State Machine ─────────────────────────
+    sm = get_state_machine()
+    estop = get_emergency_stop()
+    estop.start_hotkey_listener()
+
+    # ── 3. Parse Background / Startup Mode ───────────────────────────────────
+    is_background = "--background" in sys.argv
+
     ui = JarvisUI("face.png")
 
-    def runner():
-        ui.wait_for_api_key()
-        jarvis = JarvisLive(ui)
+    # If launched on Windows boot in background mode, minimize or start asleep
+    if is_background:
+        print("[JARVIS] ⚡ Launched in lightweight background wake-mode.")
         try:
+            if hasattr(ui._win, "showMinimized"):
+                ui._win.showMinimized()
+        except Exception:
+            pass
+
+    # ── 4. Non-Blocking Network Connectivity Monitor ─────────────────────────
+    def _on_net_connected():
+        print("[JARVIS] 🌐 Internet connected — resuming cloud connection.")
+        sm.transition(AssistantState.SLEEPING, reason="Internet restored")
+        ui.set_state("SLEEPING")
+
+    def _on_net_disconnected():
+        print("[JARVIS] ⚠️ Internet disconnected — wake-word detector remains local.")
+        sm.transition(AssistantState.OFFLINE, reason="Internet offline")
+        ui.set_state("OFFLINE")
+
+    net_monitor = NetworkMonitor(
+        on_connected=_on_net_connected,
+        on_disconnected=_on_net_disconnected,
+        logger=lambda m: print(f"[Startup] {m}"),
+    )
+    net_monitor.start()
+
+    def runner():
+        try:
+            ui.wait_for_api_key()
+            jarvis = JarvisLive(ui)
+            # If in background mode, start sleeping
+            if is_background and jarvis._wake_enabled:
+                jarvis.sleep(reason="started in background mode")
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
             print("\n🔴 Shutting down...")
+        finally:
+            net_monitor.stop()
+            estop.stop_hotkey_listener()
+            release_instance_lock()
 
     threading.Thread(target=runner, daemon=True).start()
-    ui.root.mainloop()
+    try:
+        ui.root.mainloop()
+    finally:
+        net_monitor.stop()
+        estop.stop_hotkey_listener()
+        release_instance_lock()
 
 if __name__ == "__main__":
     main()

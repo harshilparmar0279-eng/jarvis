@@ -908,6 +908,21 @@ class HudCanvas(QWidget):
         elif self.state == "LISTENING":
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  LISTENING",  qcol(C.GREEN)
+        elif self.state == "EXECUTING":
+            sym = "⚙" if self._blink else "⚡"
+            txt, col = f"{sym}  EXECUTING",  qcol(C.ACC)
+        elif self.state == "VERIFYING":
+            sym = "🔍" if self._blink else "👁"
+            txt, col = f"{sym}  VERIFYING",  qcol(C.ACC2)
+        elif self.state == "PAUSED_FOR_MANUAL_CONTROL":
+            sym = "✋" if self._blink else "⏸"
+            txt, col = f"{sym}  MANUAL CONTROL ACTIVE", qcol(C.RED)
+        elif self.state == "OFFLINE":
+            sym = "⚡" if self._blink else "⚠"
+            txt, col = f"{sym}  OFFLINE (LOCAL WAKE ACTIVE)", qcol(C.ACC)
+        elif self.state == "STOPPED":
+            sym = "🛑" if self._blink else "⏹"
+            txt, col = f"{sym}  STOPPED", qcol(C.RED)
         else:
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  {self.state}", qcol(C.PRI)
@@ -5622,6 +5637,10 @@ class MainWindow(QMainWindow):
         self._hud_btn.clicked.connect(self._toggle_hud_style)
         self._refresh_hud_btn()
 
+        self._startup_btn = _row(QPushButton())
+        self._startup_btn.clicked.connect(self._toggle_startup)
+        self._refresh_startup_btn()
+
         w.adjustSize()
         return w
 
@@ -6446,6 +6465,45 @@ class MainWindow(QMainWindow):
             "while you are not holding it." if ptt
             else "Hold a key to talk instead of streaming the mic continuously.")
 
+
+    def _refresh_startup_btn(self):
+        """Update Start with Windows button state."""
+        if not hasattr(self, "_startup_btn"):
+            return
+        try:
+            from core.startup import is_startup_enabled
+            enabled = is_startup_enabled()
+        except Exception:
+            enabled = False
+        _on = f"""
+            QPushButton {{ background: #001a08; color: {C.GREEN};
+                border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                text-align: left; padding: 0 8px; }}
+            QPushButton:hover {{ background: #002010; }}"""
+        _off = f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_DIM};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+                text-align: left; padding: 0 8px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}"""
+        self._startup_btn.setText("⚡  START ON BOOT: ON" if enabled else "⚡  START ON BOOT: OFF")
+        self._startup_btn.setStyleSheet(_on if enabled else _off)
+        self._startup_btn.setToolTip(
+            "Launch JARVIS in lightweight background mode after sign in." if enabled
+            else "Automatically start JARVIS when you sign into Windows.")
+
+    def _toggle_startup(self):
+        """Toggle Windows startup registration."""
+        try:
+            from core.startup import is_startup_enabled, enable_startup, disable_startup
+            if is_startup_enabled():
+                ok, msg = disable_startup()
+                self._append_log(f"SYS: {msg}")
+            else:
+                ok, msg = enable_startup(background=True)
+                self._append_log(f"SYS: {msg}")
+            self._refresh_startup_btn()
+        except Exception as e:
+            self._append_log(f"ERR: Could not toggle startup — {e}")
 
     def _refresh_hud_btn(self):
         from memory.config_manager import get_hud_style

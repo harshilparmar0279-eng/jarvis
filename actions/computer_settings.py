@@ -594,16 +594,59 @@ def dark_mode():
         except Exception as e:
             print(f"[Settings] dark_mode Linux failed: {e}")
 
-def toggle_wifi():
+def wifi_status() -> dict:
+    """Detect current WiFi state before/after change: enabled, connected, ssid."""
+    if _OS == "Windows":
+        try:
+            res = subprocess.run(
+                ["netsh", "wlan", "show", "interfaces"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, **_WIN_HIDE
+            )
+            out = res.stdout
+            if "State" in out:
+                connected = bool(re.search(r"State\s*:\s*connected", out, re.IGNORECASE))
+                ssid_match = re.search(r"SSID\s*:\s*(.+)", out)
+                ssid = ssid_match.group(1).strip() if ssid_match else None
+                return {"enabled": True, "connected": connected, "ssid": ssid}
+            elif "there is no wireless interface" in out.lower() or "hosted network" in out.lower():
+                ps_res = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-NetAdapter | Where-Object {$_.PhysicalMediaType -eq 'Native 802.11'}).Status"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, **_WIN_HIDE
+                )
+                status = ps_res.stdout.strip().lower()
+                return {"enabled": (status == "up"), "connected": (status == "up"), "ssid": None}
+        except Exception as e:
+            print(f"[Settings] wifi_status probe error: {e}")
+        return {"enabled": None, "connected": None, "ssid": None}
+    elif _OS == "Darwin":
+        try:
+            iface = _get_macos_wifi_interface()
+            result = subprocess.run(
+                ["networksetup", "-getairportpower", iface],
+                capture_output=True, text=True, encoding="utf-8", errors="replace"
+            )
+            on = "On" in result.stdout
+            return {"enabled": on, "connected": on, "ssid": None}
+        except Exception:
+            return {"enabled": None, "connected": None, "ssid": None}
+    else:
+        try:
+            result = subprocess.run(["nmcli", "radio", "wifi"], capture_output=True, text=True)
+            on = "enabled" in result.stdout.lower()
+            return {"enabled": on, "connected": on, "ssid": None}
+        except Exception:
+            return {"enabled": None, "connected": None, "ssid": None}
+
+
+def toggle_wifi() -> str:
+    """Toggle WiFi with observable before-and-after state verification."""
+    before = wifi_status()
+
     if _OS == "Darwin":
         iface = _get_macos_wifi_interface()
-        result = subprocess.run(
-            ["networksetup", "-getairportpower", iface],
-            capture_output=True, text=True, encoding="utf-8", errors="replace"
-        )
-        state = "off" if "On" in result.stdout else "on"
-        subprocess.run(["networksetup", "-setairportpower", iface, state],
-            capture_output=True)
+        target_state = "off" if before.get("enabled") else "on"
+        subprocess.run(["networksetup", "-setairportpower", iface, target_state], capture_output=True)
     elif _OS == "Windows":
         try:
             subprocess.run(
@@ -615,13 +658,32 @@ def toggle_wifi():
             )
         except Exception as e:
             print(f"[Settings] toggle_wifi Windows failed: {e}")
+            return outcome.failed("toggle_wifi", f"PowerShell adapter command failed: {e}")
     else:
         try:
-            result = subprocess.run(["nmcli", "radio", "wifi"], capture_output=True, text=True, encoding="utf-8", errors="replace")
-            state  = "off" if "enabled" in result.stdout else "on"
-            subprocess.run(["nmcli", "radio", "wifi", state], capture_output=True)
+            target_state = "off" if before.get("enabled") else "on"
+            subprocess.run(["nmcli", "radio", "wifi", target_state], capture_output=True)
         except Exception as e:
             print(f"[Settings] toggle_wifi Linux failed: {e}")
+            return outcome.failed("toggle_wifi", f"nmcli command failed: {e}")
+
+    # Wait for OS adapter to transition state
+    time.sleep(1.8)
+    after = wifi_status()
+
+    if before.get("enabled") is not None and after.get("enabled") is not None:
+        if before["enabled"] != after["enabled"]:
+            new_mode = "enabled" if after["enabled"] else "disabled"
+            return outcome.done("toggle_wifi", before=before["enabled"], after=after["enabled"], status=new_mode, verified=True)
+        else:
+            return outcome.unverified(
+                "toggle_wifi",
+                "WiFi toggle command was issued, but adapter status did not reflect a change upon inspection",
+                before=before["enabled"],
+                after=after["enabled"],
+            )
+
+    return outcome.unverified("toggle_wifi", "WiFi toggle command was executed, but adapter state could not be verified")
 
 def restart_computer():
     if _OS == "Windows":
