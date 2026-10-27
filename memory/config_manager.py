@@ -74,6 +74,20 @@ def save_assistant_config(assistant_name: str, user_name: str) -> None:
     data["user_name"] = user_name.strip()
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
+RESOURCE_PROFILES = ("low_ram", "balanced", "full")
+
+
+def get_resource_profile() -> str:
+    """Return the saved resource profile: 'low_ram', 'balanced', or 'full'."""
+    val = str(load_api_keys().get("resource_profile", "balanced")).strip().lower()
+    return val if val in RESOURCE_PROFILES else "balanced"
+
+
+def save_resource_profile(profile: str) -> None:
+    """Save the chosen resource profile."""
+    p = str(profile or "").strip().lower()
+    _save_flag("resource_profile", p if p in RESOURCE_PROFILES else "balanced")
+
 
 # ── Assistant voice ──────────────────────────────────────────────────────────
 # Gemini Live prebuilt voices. Names are proper nouns — identical in every

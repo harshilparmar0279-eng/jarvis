@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import importlib.util
 import os
+import re
 import platform
 import shutil
 import subprocess
@@ -83,6 +84,140 @@ def _load_playwright() -> None:
 
 
 _OS = platform.system()   # "Windows" | "Darwin" | "Linux"
+
+# ── Centralized Browser & Media Configuration ────────────────────────────────
+YOUTUBE_URL = "https://www.youtube.com/?authuser=0"
+YOUTUBE_MUSIC_URL = "https://music.youtube.com/"
+DEFAULT_BROWSER = "chrome"
+
+
+def route_media_command(text: str) -> dict:
+    """Centralized browser selection and media-command routing for Jarvis.
+
+    Rules:
+    A. 'YouTube kholo' / 'Open YouTube' -> Open YOUTUBE_URL in Chrome by default.
+    B. 'YouTube Music kholo' / 'Open YouTube Music' -> Open YOUTUBE_MUSIC_URL in Chrome by default.
+    C. 'Play [song]' / '[song] music play karo' -> Open YouTube Music in Chrome, search, select, play & verify.
+    D. 'Chrome mein [song] play karo' -> Open regular YouTube in Chrome, search, select, play & verify.
+    E. Explicit browser requests ('Brave mein YouTube kholo') override defaults. Without a specified browser,
+       use Chrome for YouTube and YouTube Music commands. Never silently fall back to Brave.
+    """
+    raw = (text or "").strip()
+    low = raw.lower()
+
+    # 1. Detect explicit browser request
+    explicit_browser = None
+    if re.search(r"\bbrave\b", low):
+        explicit_browser = "brave"
+    elif re.search(r"\bchrome\b", low):
+        explicit_browser = "chrome"
+    elif re.search(r"\bedge\b", low):
+        explicit_browser = "edge"
+    elif re.search(r"\bfirefox\b", low):
+        explicit_browser = "firefox"
+
+    # 2. Check if YouTube Music is explicitly named
+    is_yt_music = bool(re.search(r"youtube\s*music", low))
+
+    # 3. Check for open / navigate commands without song query
+    is_open_cmd = bool(re.search(r"\b(open|kholo|chalao|khol\s*do|start|launch)\b", low))
+    has_play_verb = bool(re.search(r"\b(play|baja|sunao|chalao)\b", low))
+
+    # Case A & B: Opening YouTube or YouTube Music directly
+    just_yt = bool(re.search(r"^(open\s+)?youtube(\s+(kholo|chalao|open\s*karo))?$", low) or
+                  re.search(r"^(brave|chrome)\s+(mein|me|in)\s+youtube(\s+(kholo|open\s*karo))?$", low) or
+                  re.search(r"^youtube(\s+(kholo|chalao|open\s*karo))?(\s+(in|mein|me)\s+(brave|chrome))?$", low))
+
+    just_ytm = bool(re.search(r"^(open\s+)?youtube\s*music(\s+(kholo|chalao|open\s*karo))?$", low) or
+                   re.search(r"^(brave|chrome)\s+(mein|me|in)\s+youtube\s*music(\s+(kholo|open\s*karo))?$", low) or
+                   re.search(r"^youtube\s*music(\s+(kholo|chalao|open\s*karo))?(\s+(in|mein|me)\s+(brave|chrome))?$", low))
+
+    if just_ytm or (is_yt_music and is_open_cmd and not has_play_verb):
+        target_browser = explicit_browser or DEFAULT_BROWSER
+        return {
+            "action": "go_to",
+            "url": YOUTUBE_MUSIC_URL,
+            "browser": target_browser,
+            "rule": "B: Open YouTube Music"
+        }
+
+    if just_yt or (re.search(r"\byoutube\b", low) and not is_yt_music and (is_open_cmd or not has_play_verb) and not re.search(r"\b(song|video|track|music|gaana|geet)\b", low)):
+        target_browser = explicit_browser or DEFAULT_BROWSER
+        return {
+            "action": "go_to",
+            "url": YOUTUBE_URL,
+            "browser": target_browser,
+            "rule": "A/E: Open YouTube"
+        }
+
+    # Case C & D: Play song commands
+    cleaned = raw
+    # Strip browser preposition phrases
+    cleaned = re.sub(r"(?i)\b(in|on|using|mein|me)\s+(chrome|brave|edge|firefox)\b", "", cleaned)
+    cleaned = re.sub(r"(?i)\b(chrome|brave|edge|firefox)\s+(mein|me|in|on)\b", "", cleaned)
+    # Strip command verbs
+    cleaned = re.sub(r"(?i)\b(music\s+play\s+karo|play\s+karo|chala\s+do|chalao|baja\s+do|baja|sunao|suna\s+do|khol\s+do|kholo|open|play)\b", "", cleaned)
+    # Strip keywords
+    cleaned = re.sub(r"(?i)\b(music|song|gaana|geet|video)\b", "", cleaned)
+    cleaned = re.sub(r"(?i)\byoutube\s*music\b", "", cleaned)
+    cleaned = re.sub(r"(?i)\byoutube\b", "", cleaned)
+    cleaned = cleaned.strip(" -:,.")
+
+    # Check for artist split ("by [artist]")
+    artist = ""
+    query = cleaned
+    by_match = re.search(r"(?i)\s+by\s+(.+)$", cleaned)
+    if by_match:
+        artist = by_match.group(1).strip()
+        query = cleaned[:by_match.start()].strip()
+
+    # Rule D: 'Chrome mein [song name] play karo' -> Regular YouTube in Chrome!
+    if explicit_browser == "chrome" and not is_yt_music:
+        return {
+            "action": "youtube_play",
+            "query": query or cleaned,
+            "artist": artist,
+            "browser": "chrome",
+            "rule": "D: Regular YouTube in Chrome"
+        }
+
+    # Rule E: Explicit browser YouTube Play
+    if explicit_browser and not is_yt_music:
+        return {
+            "action": "youtube_play",
+            "query": query or cleaned,
+            "artist": artist,
+            "browser": explicit_browser,
+            "rule": "E: Explicit browser YouTube Play"
+        }
+
+    # If no specific song was named (e.g. "YouTube music chala do" / "YouTube kholo")
+    if not (query or cleaned) or (query or cleaned).lower() in ("youtube music", "music", "youtube"):
+        target_browser = explicit_browser or DEFAULT_BROWSER
+        if is_yt_music:
+            return {
+                "action": "go_to",
+                "url": YOUTUBE_MUSIC_URL,
+                "browser": target_browser,
+                "rule": "B: Open YouTube Music"
+            }
+        else:
+            return {
+                "action": "go_to",
+                "url": YOUTUBE_URL,
+                "browser": target_browser,
+                "rule": "A/E: Open YouTube"
+            }
+
+    # Rule C: 'Play [song name]' / '[song name] music play karo' -> YouTube Music in Chrome!
+    target_browser = explicit_browser or DEFAULT_BROWSER
+    return {
+        "action": "youtube_music_play",
+        "query": query or cleaned,
+        "artist": artist,
+        "browser": target_browser,
+        "rule": "C: YouTube Music Play"
+    }
 
 def _normalize_url(url: str) -> str:
     """
@@ -371,8 +506,8 @@ def _resolve_browser(name: str) -> dict | None:
                     exe = str(found_bins[0])
                     break
 
-    if not exe and _OS == "Windows" and not channel:
-        exe = _find_exe_windows(name)
+    if not exe and _OS == "Windows":
+        exe = _find_exe_windows(_WIN_EXE_HINTS.get(name, name))
 
     return {"engine": engine, "exe": exe, "channel": channel}
 
@@ -450,11 +585,26 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
         url = ""
 
     name = None
+    is_yt = bool(url and ("youtube.com" in url.lower() or "youtu.be" in url.lower()))
     if browser_name:
         name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
+    elif is_yt:
+        # Rule: Without a specified browser, use Chrome for YouTube and YouTube Music
+        name = DEFAULT_BROWSER
     elif not url:
         # No URL → only a window will open; needs the default browser's exe
         name = _detect_default_browser()
+
+    # Rule E: Never silently fall back to Brave if Chrome is unavailable
+    if name == "chrome":
+        spec = _resolve_browser("chrome")
+        exe = spec.get("exe") if spec else None
+        if not exe and _OS == "Windows":
+            exe = _find_exe_windows("chrome")
+        if not exe and _OS != "Windows":
+            exe = shutil.which("google-chrome") or shutil.which("google-chrome-stable") or shutil.which("chromium")
+        if not exe:
+            return outcome.failed("browser_control", "Google Chrome is not installed or available on this system.")
 
     # Specific browser → launch its own executable, exactly like the user would.
     if name:
@@ -904,6 +1054,67 @@ class _BrowserSession:
         # Observable verification of video playback
         return await self._verify_video_playback(page, expected_title=best_title)
 
+    async def youtube_music_play(self, query: str, artist: str = "") -> str:
+        """Search YouTube Music, select best playable match, start playback,
+        and verify actual media playback using observable DOM evidence.
+        """
+        full_query = f"{query} {artist}".strip()
+        if not full_query:
+            return outcome.failed("browser_control", "No song title provided")
+
+        encoded = urllib.parse.quote_plus(full_query)
+        search_url = f"https://music.youtube.com/search?q={encoded}"
+
+        page = await self._get_page()
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(0.5)
+            await self._dismiss_popups(page)
+        except Exception as e:
+            print(f"[Browser] YouTube Music search navigation notice: {e}")
+
+        # Wait for search results shelf / list items
+        try:
+            await page.wait_for_selector(
+                "ytmusic-responsive-list-item-renderer, ytmusic-shelf-renderer, ytmusic-card-shelf-renderer",
+                timeout=10_000
+            )
+        except Exception:
+            return outcome.failed("browser_control", f"No music search results appeared for: '{full_query}'")
+
+        best_element = None
+        best_title = ""
+        try:
+            items = page.locator("ytmusic-responsive-list-item-renderer")
+            count = min(await items.count(), 6)
+            if count > 0:
+                top_item = items.first
+                title_elem = top_item.locator(".title a, .title-column a, a[href*='watch?v=']").first
+                if await title_elem.count() > 0:
+                    best_title = (await title_elem.inner_text()).strip()
+                    best_element = title_elem
+                else:
+                    best_element = top_item
+            else:
+                play_btn = page.locator("ytmusic-play-button-renderer, button[aria-label='Play'], a[href*='watch?v=']").first
+                if await play_btn.count() > 0:
+                    best_element = play_btn
+                    best_title = full_query
+        except Exception as e:
+            print(f"[Browser] Error finding YouTube Music playable item: {e}")
+
+        if not best_element:
+            return outcome.failed("browser_control", f"Could not find playable track for '{full_query}' on YouTube Music")
+
+        try:
+            await best_element.click(timeout=8_000)
+            await asyncio.sleep(1.0)
+            await self._dismiss_popups(page)
+        except Exception as e:
+            return outcome.failed("browser_control", f"Failed clicking YouTube Music track: {e}")
+
+        return await self._verify_video_playback(page, expected_title=best_title or full_query)
+
     async def _verify_video_playback(self, page: Page, expected_title: str = "") -> str:
         """Verify that playback has actually started via observable media state."""
         # Wait up to 8s for video element
@@ -1341,7 +1552,31 @@ def browser_control(
     params  = parameters or {}
     action  = params.get("action", "").lower().strip()
     browser = params.get("browser", "").lower().strip() or None
+    url_param = str(params.get("url", "")).strip()
     result  = "Unknown action."
+
+    # Rule: If YouTube / YouTube Music is targeted and browser not specified, default to Chrome
+    is_yt_target = False
+    if action in ("youtube_play", "youtube_music_play", "play_song", "play_video"):
+        is_yt_target = True
+    elif url_param and any(yt in url_param.lower() for yt in ("youtube.com", "youtu.be", "music.youtube.com")):
+        is_yt_target = True
+
+    if is_yt_target and not browser:
+        browser = DEFAULT_BROWSER  # "chrome"
+
+    # Rule E: Never silently fall back to Brave if Chrome is requested/defaulted but unavailable
+    if browser == "chrome":
+        spec = _resolve_browser("chrome")
+        exe = spec.get("exe") if spec else None
+        if not exe and _OS == "Windows":
+            exe = _find_exe_windows("chrome")
+        if not exe and _OS != "Windows":
+            exe = shutil.which("google-chrome") or shutil.which("google-chrome-stable") or shutil.which("chromium")
+        if not exe:
+            msg = "Google Chrome is not installed or available on this system."
+            _log(player, msg)
+            return outcome.failed("browser_control", msg)
 
     if action == "switch":
         target = browser or params.get("target", "").lower().strip()
@@ -1421,7 +1656,11 @@ def browser_control(
             except Exception as e:
                 print(f"[Browser] Could not resume last page ({last}): {e}")
 
-        if action in ("youtube_play", "play_video", "play_song"):
+        if action in ("youtube_music_play", "play_song", "music_play"):
+            query = params.get("query") or params.get("title") or params.get("text", "")
+            artist = params.get("artist", "")
+            result = sess.run(sess.youtube_music_play(query, artist))
+        elif action in ("youtube_play", "play_video"):
             query = params.get("query") or params.get("title") or params.get("text", "")
             artist = params.get("artist", "")
             result = sess.run(sess.youtube_play(query, artist))

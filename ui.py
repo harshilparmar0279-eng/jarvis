@@ -49,6 +49,13 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
     HAVE_VIDEO = False
     print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
 
+try:
+    from ui_resource_guardian import ResourceSparkline, ResourceDiagnosticsOverlay
+    from core.resource_guardian import ResourceGuardian
+except Exception as _e:
+    ResourceSparkline = ResourceDiagnosticsOverlay = ResourceGuardian = None
+    print(f"[ResourceGuardian] UI components unavailable: {_e}")
+
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
@@ -4557,6 +4564,13 @@ class MainWindow(QMainWindow):
         self._cam_preview = _CameraPreview(self.centralWidget())
 
         # Clipboard panel (child of central widget, bottom-center)
+        # Ensure desktop shortcut exists on normal launch (idempotent)
+        try:
+            if platform.system() == "Windows" and not (self._get_desktop_dir() / "Jarvis.lnk").exists():
+                self._create_desktop_shortcut()
+        except Exception as _e:
+            print(f"[Desktop] Shortcut check note: {_e}")
+
         self._clipboard_panel = ClipboardPanel(self.centralWidget())
         self._clipboard_panel.action_requested.connect(self._on_clipboard_action)
         QApplication.clipboard().dataChanged.connect(self._on_clipboard_changed)
@@ -5031,7 +5045,8 @@ class MainWindow(QMainWindow):
         # display-only). Everything else lands here as a last resort.
         return home / "Desktop"
 
-    def _create_desktop_shortcut(self):
+    @classmethod
+    def _create_desktop_shortcut(cls, inst=None):
         """
         Create a desktop shortcut on Windows / macOS / Linux.
         Never opens a terminal, console, or PowerShell window on any platform.
@@ -5039,24 +5054,32 @@ class MainWindow(QMainWindow):
         import stat as _stat
         script  = Path(__file__).resolve().parent / "main.py"
         python  = Path(sys.executable)
-        desktop = self._get_desktop_dir()
+        desktop = cls._get_desktop_dir()
 
         # Arc-reactor icon (.ico — also exported as .png for Linux/macOS)
         ico_path = Path(__file__).resolve().parent / "config" / "jarvis.ico"
         if not ico_path.exists():
-            self._build_jarvis_icon(ico_path)
+            cls._build_jarvis_icon(ico_path)
 
         try:
             _os = platform.system()
 
             # ── Windows ───────────────────────────────────────────────────────
             if _os == "Windows":
-                pythonw  = python.parent / "pythonw.exe"
-                target   = str(pythonw if pythonw.exists() else python)
-                lnk      = str(desktop / "J.A.R.V.I.S.lnk")
+                base_dir = Path(__file__).resolve().parent
+                venv_pw = base_dir / ".venv" / "Scripts" / "pythonw.exe"
+                venv_py = base_dir / ".venv" / "Scripts" / "python.exe"
+                if venv_pw.exists():
+                    target = str(venv_pw)
+                elif venv_py.exists():
+                    target = str(venv_py)
+                else:
+                    pythonw  = python.parent / "pythonw.exe"
+                    target   = str(pythonw if pythonw.exists() else python)
+                lnk      = str(desktop / "Jarvis.lnk")
                 icon_loc = str(ico_path) if ico_path.exists() else f"{target},0"
-                self._create_lnk_windows(lnk, target, str(script),
-                                         str(script.parent), icon_loc)
+                cls._create_lnk_windows(lnk, target, str(script),
+                                        str(script.parent), icon_loc)
 
             # ── macOS — proper .app bundle (no Terminal window) ───────────────
             elif _os == "Darwin":
@@ -5137,9 +5160,13 @@ class MainWindow(QMainWindow):
                 )
                 desk.chmod(desk.stat().st_mode | 0o755)
 
-            self._log.append_log("SYS: Desktop shortcut created.")
+            if inst and hasattr(inst, "_log"):
+                inst._log.append_log("SYS: Desktop shortcut created.")
         except Exception as e:
-            self._log.append_log(f"ERR: Shortcut failed — {e}")
+            if inst and hasattr(inst, "_log"):
+                inst._log.append_log(f"ERR: Shortcut failed — {e}")
+            else:
+                print(f"[Desktop] Shortcut failed — {e}")
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -5191,6 +5218,13 @@ class MainWindow(QMainWindow):
 
     def _update_metrics(self):
         snap = _metrics.snapshot()
+        try:
+            if ResourceGuardian is not None:
+                ResourceGuardian.get_instance().capture_snapshot()
+            if hasattr(self, "_sparkline") and self._sparkline:
+                self._sparkline.update()
+        except Exception:
+            pass
 
         # CPU
         cpu = snap["cpu"]
@@ -5380,6 +5414,10 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(info_panel)
         lay.addSpacing(4)
+        if ResourceSparkline is not None:
+            self._sparkline = ResourceSparkline(on_click=self._open_resource_diagnostics)
+            lay.addWidget(self._sparkline)
+            lay.addSpacing(4)
 
         lay.addStretch()
 
@@ -5531,6 +5569,14 @@ class MainWindow(QMainWindow):
         self._autostart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._autostart_btn.clicked.connect(self._toggle_autostart)
         lay.addWidget(self._autostart_btn)
+
+        diag_btn = QPushButton("◈  RESOURCE GUARDIAN")
+        diag_btn.setFixedHeight(26)
+        diag_btn.setFont(QFont("Courier New", 7))
+        diag_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        diag_btn.setStyleSheet(_BTN_STYLE_DIM)
+        diag_btn.clicked.connect(self._open_resource_diagnostics)
+        lay.addWidget(diag_btn)
 
         cust_btn = QPushButton("⚙  CUSTOMISE ASSISTANT")
         cust_btn.setFixedHeight(26)
@@ -6807,6 +6853,23 @@ class MainWindow(QMainWindow):
             self.on_audio_device_change()
 
     # ── Memory panel ─────────────────────────────────────────────────────────
+
+    def _open_resource_diagnostics(self):
+        if ResourceDiagnosticsOverlay is None:
+            self.write_log("Resource Guardian overlay unavailable.")
+            return
+        if getattr(self, "_res_diag_overlay", None) is None:
+            self._res_diag_overlay = ResourceDiagnosticsOverlay(
+                parent=self.centralWidget(),
+                on_profile_changed=self._on_resource_profile_changed,
+            )
+        self._centre_overlay(self._res_diag_overlay)
+        self._res_diag_overlay.refresh()
+        self._res_diag_overlay.show()
+        self._res_diag_overlay.raise_()
+
+    def _on_resource_profile_changed(self, profile: str):
+        self.write_log(f"Resource Guardian profile → {profile.upper()}")
 
     def _open_memory_panel(self):
         ov = MemoryOverlay(parent=self.centralWidget())
