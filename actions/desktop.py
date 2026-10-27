@@ -73,7 +73,7 @@ def _get_desktop() -> Path:
 
 
 _ACTIONS = ("wallpaper", "wallpaper_url", "current_wallpaper",
-            "organize", "clean", "list", "stats")
+            "organize", "clean", "list", "stats", "shortcut")
 
 
 def _unknown(said: str) -> str:
@@ -464,6 +464,18 @@ def desktop_control(
         elif action == "stats":
             return get_desktop_stats()
 
+        elif action in ("shortcut", "create_shortcut", "desktop_icon", "home_screen_icon"):
+            try:
+                from ui import MainWindow
+                MainWindow._create_desktop_shortcut()
+                desktop_dir = MainWindow._get_desktop_dir()
+                lnk = desktop_dir / "Jarvis.lnk"
+                if lnk.exists():
+                    return outcome.done("desktop_control", detail=f"JARVIS desktop shortcut and home screen icon verified at {lnk}", path=str(lnk))
+                return outcome.done("desktop_control", detail="Desktop shortcut created successfully.")
+            except Exception as _e:
+                return outcome.failed("desktop_control", f"Could not create desktop shortcut: {_e}")
+
         return _unknown(action or params.get("task", ""))
 
     except Exception as e:
@@ -500,9 +512,9 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "wallpaper | wallpaper_url | current_wallpaper | organize | clean | list | stats",
+                "description": "wallpaper | wallpaper_url | current_wallpaper | organize | clean | list | stats | shortcut",
                 "enum": ["wallpaper", "wallpaper_url", "current_wallpaper",
-                         "organize", "clean", "list", "stats"]
+                         "organize", "clean", "list", "stats", "shortcut"]
             },
             "path": {
                 "type": "STRING",

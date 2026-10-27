@@ -797,6 +797,48 @@ class DashboardServer:
     def _build_app(self) -> "FastAPI":
         app = FastAPI(docs_url=None, redoc_url=None)
 
+        try:
+            from starlette.staticfiles import StaticFiles
+            if STATIC_DIR.exists():
+                app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+        except Exception as _e:
+            print(f"[Dashboard] StaticFiles mount note: {_e}")
+
+        @app.get("/manifest.json")
+        async def manifest_ep():
+            p = STATIC_DIR / "manifest.json"
+            if p.exists():
+                return FileResponse(str(p), media_type="application/manifest+json")
+            return JSONResponse({"error": "manifest not found"}, status_code=404)
+
+        @app.get("/favicon.ico")
+        async def favicon_ep():
+            p = STATIC_DIR / "favicon.ico"
+            if p.exists():
+                return FileResponse(str(p), media_type="image/x-icon")
+            return JSONResponse({"error": "favicon not found"}, status_code=404)
+
+        @app.get("/apple-touch-icon.png")
+        async def apple_touch_icon_ep():
+            p = STATIC_DIR / "apple-touch-icon.png"
+            if p.exists():
+                return FileResponse(str(p), media_type="image/png")
+            return JSONResponse({"error": "icon not found"}, status_code=404)
+
+        @app.get("/icon-192.png")
+        async def icon_192_ep():
+            p = STATIC_DIR / "icon-192.png"
+            if p.exists():
+                return FileResponse(str(p), media_type="image/png")
+            return JSONResponse({"error": "icon not found"}, status_code=404)
+
+        @app.get("/icon-512.png")
+        async def icon_512_ep():
+            p = STATIC_DIR / "icon-512.png"
+            if p.exists():
+                return FileResponse(str(p), media_type="image/png")
+            return JSONResponse({"error": "icon not found"}, status_code=404)
+
         def _valid(tok: str) -> bool:
             """Is this token live? Expired ones are dropped as they are found,
             which keeps the sweep free and needs no background timer."""

@@ -2656,6 +2656,13 @@ class JarvisLive:
             await asyncio.sleep(delay)
 
 def main():
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("jarvis.desktop.assistant")
+        except Exception:
+            pass
+
     # ── 1. Single Instance Check (Named Windows Mutex) ───────────────────────
     if not acquire_instance_lock():
         print("[JARVIS] ⚠️ Another instance of JARVIS is already running. Exiting.")

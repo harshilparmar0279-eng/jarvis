@@ -4291,6 +4291,13 @@ class MainWindow(QMainWindow):
             apply_ui_accent(_ui_color)
 
         self.setWindowTitle(f"{_display} — {APP_VERSION}")
+        ico_path = Path(__file__).resolve().parent / "config" / "jarvis.ico"
+        if not ico_path.exists():
+            self._build_jarvis_icon(ico_path)
+        if ico_path.exists():
+            app_icon = QIcon(str(ico_path))
+            self.setWindowIcon(app_icon)
+            QApplication.setWindowIcon(app_icon)
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
@@ -4566,6 +4573,7 @@ class MainWindow(QMainWindow):
         # Clipboard panel (child of central widget, bottom-center)
         # Ensure desktop shortcut exists on normal launch (idempotent)
         try:
+            self._ensure_home_screen_icons()
             if platform.system() == "Windows" and not (self._get_desktop_dir() / "Jarvis.lnk").exists():
                 self._create_desktop_shortcut()
         except Exception as _e:
@@ -5046,6 +5054,68 @@ class MainWindow(QMainWindow):
         return home / "Desktop"
 
     @classmethod
+    def _ensure_home_screen_icons(cls) -> None:
+        """Ensure both Windows desktop shortcut icon and mobile home screen PWA icons exist."""
+        base_dir = Path(__file__).resolve().parent
+        ico_path = base_dir / "config" / "jarvis.ico"
+        if not ico_path.exists():
+            cls._build_jarvis_icon(ico_path)
+
+        static_dir = base_dir / "dashboard" / "static"
+        static_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = static_dir / "manifest.json"
+        if not manifest_path.exists():
+            import json
+            manifest_data = {
+                "name": "JARVIS Remote Control",
+                "short_name": "JARVIS",
+                "description": "JARVIS Autonomous Voice & Desktop Control Interface",
+                "start_url": "/",
+                "display": "standalone",
+                "orientation": "portrait",
+                "background_color": "#07090f",
+                "theme_color": "#00e5ff",
+                "icons": [
+                    {
+                        "src": "/static/icon-192.png",
+                        "sizes": "192x192",
+                        "type": "image/png",
+                        "purpose": "any maskable"
+                    },
+                    {
+                        "src": "/static/icon-512.png",
+                        "sizes": "512x512",
+                        "type": "image/png",
+                        "purpose": "any maskable"
+                    },
+                    {
+                        "src": "/static/apple-touch-icon.png",
+                        "sizes": "180x180",
+                        "type": "image/png"
+                    }
+                ]
+            }
+            manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+
+        icon_192 = static_dir / "icon-192.png"
+        icon_512 = static_dir / "icon-512.png"
+        apple_icon = static_dir / "apple-touch-icon.png"
+        fav_ico = static_dir / "favicon.ico"
+        if ico_path.exists() and (not icon_192.exists() or not icon_512.exists() or not apple_icon.exists()):
+            try:
+                import PIL.Image
+                im = PIL.Image.open(ico_path)
+                im.resize((512, 512), PIL.Image.LANCZOS).save(icon_512, "PNG")
+                im.resize((192, 192), PIL.Image.LANCZOS).save(icon_192, "PNG")
+                im.resize((180, 180), PIL.Image.LANCZOS).save(apple_icon, "PNG")
+                im.resize((32, 32), PIL.Image.LANCZOS).save(static_dir / "favicon-32x32.png", "PNG")
+                im.resize((16, 16), PIL.Image.LANCZOS).save(static_dir / "favicon-16x16.png", "PNG")
+                if not fav_ico.exists():
+                    im.save(fav_ico)
+            except Exception as e:
+                print(f"[Icon] Home screen icon export note: {e}")
+
+    @classmethod
     def _create_desktop_shortcut(cls, inst=None):
         """
         Create a desktop shortcut on Windows / macOS / Linux.
@@ -5080,6 +5150,11 @@ class MainWindow(QMainWindow):
                 icon_loc = str(ico_path) if ico_path.exists() else f"{target},0"
                 cls._create_lnk_windows(lnk, target, str(script),
                                         str(script.parent), icon_loc)
+                try:
+                    import ctypes
+                    ctypes.windll.shell32.SHChangeNotify(0x08000000, 0x0000, None, None)
+                except Exception:
+                    pass
 
             # ── macOS — proper .app bundle (no Terminal window) ───────────────
             elif _os == "Darwin":
@@ -7065,6 +7140,11 @@ class JarvisUI:
     def __init__(self, face_path: str, size=None):
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
+        ico_path = Path(__file__).resolve().parent / "config" / "jarvis.ico"
+        if not ico_path.exists():
+            MainWindow._build_jarvis_icon(ico_path)
+        if ico_path.exists():
+            self._app.setWindowIcon(QIcon(str(ico_path)))
         self._win = MainWindow(face_path)
         self.root = _RootShim(self._app)
         self._win.show()
